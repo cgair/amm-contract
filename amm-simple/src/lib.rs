@@ -2,23 +2,15 @@
 use near_sdk::{
     env,
     borsh::{self, BorshSerialize, BorshDeserialize},
-    json_types::U128,
     near_bindgen,
     require,
     PanicOnDefault,
-    AccountId, Balance, Promise, log,
-};
-
-use near_contract_standards::{
-    fungible_token::{
-        FungibleToken,
-        metadata::FungibleTokenMetadata,
-    },
+    AccountId, Balance,
 };
 
 
 mod traits;
-// use traits::*;
+use traits::*;
 
 // *********************************************************
 // * Data Structures for Simple AMM Contract
@@ -44,24 +36,21 @@ pub struct Contract {
 #[derive(PanicOnDefault, BorshSerialize, BorshDeserialize)]
 pub struct Token {
     account_id: AccountId,
-    ft: FungibleToken,
-    meta: FungibleTokenMetadata,
-    // reserve: Balance,
-    // /// the ticker symbol
-    // ticker: String,
-    // /// shifting all numbers by the declared number of zeros
-    // decimal: u8,
+    reserve: Balance,
+    /// the ticker symbol
+    ticker: String,
+    /// shifting all numbers by the declared number of zeros
+    decimal: u8,
 }
 
 impl Token {
     pub fn new(account_id: AccountId, prefix: &str) -> Self {
-        let mut ft = FungibleToken::new(prefix.as_bytes());
-        ft.internal_register_account(&account_id);
 
         Self {
             account_id,
-            ft,
-            meta: FungibleTokenMetadata { spec: "".to_string(), name: "".to_string(), symbol: prefix.to_string(), icon: None, reference: None, reference_hash: None, decimals: 1 }
+            reserve: 0,
+            ticker: prefix.to_string(),
+            decimal: 1,
         }
     }
 }
@@ -76,6 +65,24 @@ impl Contract {
     #[init]
     pub fn init(owner_id: AccountId, a_id: AccountId, b_id: AccountId) -> Self {
         require!(!env::state_exists(), "Already initialized");
+
+        // Requests and stores the metadata of tokens (name, decimals)
+        ext_token::ext(a_id.clone())
+            .get_info()
+            .then(
+                ext_c::ext(env::current_account_id())
+                .callback_get_info(a_id.clone()),
+            );
+
+        ext_token::ext(b_id.clone())
+            .get_info()
+            .then(
+                ext_c::ext(env::current_account_id()).callback_get_info(b_id.clone()),
+            );
+
+        // Creates wallets for tokens А & В.
+        ext_token::ext(a_id.clone()).register_amm(owner_id.clone(), 0);
+        ext_token::ext(b_id.clone()).register_amm(owner_id.clone(), 0);
 
         Self {
             admin: owner_id,
@@ -92,12 +99,24 @@ impl Contract {
         (AccountId, String, Balance, u8),
     )
     {
-        let a_id = self.token_a.account_id.clone();
-        let b_id = self.token_b.account_id.clone();
         (
-            (self.token_a.account_id.clone(), self.token_a.meta.symbol.clone(), self.token_a.ft.internal_unwrap_balance_of(&a_id), self.token_a.meta.decimals),
-            (self.token_b.account_id.clone(), self.token_b.meta.symbol.clone(), self.token_b.ft.internal_unwrap_balance_of(&b_id), self.token_b.meta.decimals)
+            (self.token_a.account_id.clone(), self.token_a.ticker.clone(), self.token_a.reserve, self.token_a.decimal),
+            (self.token_b.account_id.clone(), self.token_b.ticker.clone(), self.token_b.reserve, self.token_b.decimal)
         )
+    }
+
+    pub fn callback_get_info(&mut self, contract_id: AccountId, #[callback] val: (String, u8)) {
+        require!(
+            env::predecessor_account_id() == env::current_account_id(),
+            "Only support in self"
+        );
+        if contract_id == self.token_a.account_id {
+            // self.a_contract_name = val.0;
+            self.token_b.decimal = val.1;
+        } else if contract_id == self.token_b.account_id {
+            self.token_b.decimal = val.1;
+        }
+        self.calc_k();
     }
 
     /// Public - swaps tokens between the given account and the pool.
@@ -105,109 +124,123 @@ impl Contract {
         require!(token_in == self.token_a.account_id || token_in == self.token_b.account_id, "invalid token");
         require!(amount_in > 0, "amount in = 0");
 
-        let a_id = self.token_a.account_id.clone();
-        let b_id = self.token_b.account_id.clone();
-        let user_account_id = env::predecessor_account_id();
-
         // Pull in token in;
         if token_in == self.token_a.account_id {
-            // ext_token::ext(env::predecessor_account_id())
+            // ext_token::ext()
             //     .with_attached_deposit(1)
             //     .ft_transfer(token_in, amount_in.into());
+            let xx = self.token_a.reserve;
+            let yy = self.token_b.reserve;
 
-            let xx = self.token_a.ft.internal_unwrap_balance_of(&a_id);
-            let yy = self.token_b.ft.internal_unwrap_balance_of(&b_id);
-
-            self.token_a
-                .ft
-                .internal_transfer(&user_account_id, &a_id, amount_in, None);
-
-            let x = decimals(xx, self.token_a.meta.decimals);
-            let y = decimals(yy, self.token_b.meta.decimals);
+            let x = decimals(xx, self.token_a.decimal);
+            let y = decimals(yy, self.token_b.decimal);
 
             // Calculate token out
             let amount_out = calc_dy(x, y, amount_in);
+            
+            let a_added = self.token_a.reserve + amount_in;
+            let b_added = self.token_b.reserve - amount_out;
 
             // Transfer token out to sender
-            self.token_b
-                .ft
-                .internal_transfer(&b_id, &user_account_id, amount_out, None);
-            /*
-            ext_token::ext(self.token_b.account_id.clone())
-                .with_attached_deposit(1)
-                .ft_transfer(env::predecessor_account_id(), amount_out.into())
-                .then(
-                    // Update the reserve
-                    ext_c::ext(self.admin.clone())
-                    .update(xx + amount_in, yy - amount_out)
-                );
-            */
+            ext_token::ext(env::predecessor_account_id())
+            .ft_transfer(self.token_a.account_id.clone(), amount_in.into())
+            .then(
+                ext_c::ext(env::current_account_id())
+                .callback_ft_deposit(
+                    a_added,
+                    b_added,
+                    self.token_b.account_id.clone(),
+                    env::predecessor_account_id(),
+                    amount_out,
+                ),
+            );
         } else {
-            let xx = self.token_b.ft.internal_unwrap_balance_of(&b_id);
-            let yy = self.token_a.ft.internal_unwrap_balance_of(&a_id);
+            let xx = self.token_b.reserve;
+            let yy = self.token_a.reserve;
 
-            self.token_b
-                .ft
-                .internal_transfer(&user_account_id, &b_id, amount_in, None);
-
-            let x = decimals(xx, self.token_b.meta.decimals);
-            let y = decimals(yy, self.token_a.meta.decimals);
+            let x = decimals(xx, self.token_b.decimal);
+            let y = decimals(yy, self.token_a.decimal);
 
             // Calculate token out
             let amount_out = calc_dy(x, y, amount_in);
+            
+            let b_added = self.token_b.reserve + amount_in;
+            let a_added = self.token_a.reserve - amount_out;
 
             // Transfer token out to sender
-            self.token_a
-                .ft
-                .internal_transfer(&a_id, &user_account_id, amount_out, None);
+            ext_token::ext(env::predecessor_account_id())
+            .ft_transfer(self.token_b.account_id.clone(), amount_in.into())
+            .then(
+                ext_c::ext(env::current_account_id())
+                .callback_ft_deposit(
+                    a_added,
+                    b_added,
+                    self.token_a.account_id.clone(),
+                    env::predecessor_account_id(),
+                    amount_out,
+                ),
+            );
         }
     }
 
     /// Add tokens to the liquidity pool.
     pub fn add_liquidity(&mut self, amount_a: Balance, amount_b: Balance) {
-        let owner_id = env::predecessor_account_id();
-        let a_id = self.token_a.account_id.clone();
-        let b_id = self.token_b.account_id.clone();
+        require!(env::predecessor_account_id() == self.admin, "Must be owner");
+
+        let a_added = self.token_a.reserve + amount_a;
+        let b_added = self.token_b.reserve + amount_b;
         // Pull in token A and token B
         // TODO: Mint shares
         // Update reserves
-        self.token_a
-            .ft
-            .internal_transfer(&owner_id, &a_id, amount_a, None);
-        
-        self.token_b
-            .ft
-            .internal_transfer(&owner_id, &b_id, amount_b, None);
-        
-        /*
+
         ext_token::ext(self.admin.clone())
-        .with_attached_deposit(1)
-        .ft_transfer(self.token_a.account_id.clone(), amount_a.into())
-        .and(
-            ext_token::ext(self.admin.clone())
-            .with_attached_deposit(1)
-            .ft_transfer(self.token_b.account_id.clone(), amount_b.into())
-        )
-        .then( // Update reserves
-                ext_c::ext(self.admin.clone())
-                .update(a_added, b_added)
-            )
+            .ft_transfer(self.token_a.account_id.clone(), amount_a.into())
             .then(
-                ext_c::ext(self.admin.clone())
-                .calc_k()
-            )
-        */
+                ext_c::ext(env::current_account_id())
+                    .callback_update(a_added, b_added),
+            );
+        
+        ext_token::ext(self.admin.clone())
+            .ft_transfer(self.token_b.account_id.clone(), amount_b.into())
+            .then(
+                ext_c::ext(env::current_account_id())
+                    .callback_update(a_added, b_added),
+            );
     }
 
     // fn remove_liquidity()
+
+    pub fn callback_update(&mut self, a_added: Balance, b_added: Balance) {
+        self.token_a.reserve = a_added;
+        self.token_b.reserve = b_added;
+        self.calc_k();
+    }
+
+    pub fn callback_ft_deposit(
+        &mut self,
+        a_added: Balance,
+        b_added: Balance,
+        contract_id: AccountId,
+        receiver_id: AccountId,
+        amount: Balance,
+    ) {
+        require!(
+            env::predecessor_account_id() == env::current_account_id(),
+            "Only support to call by itself"
+        );
+
+        ext_token::ext(contract_id)
+            .ft_transfer(receiver_id, amount.into())
+            .then(
+                ext_c::ext(env::current_account_id())
+                    .callback_update(a_added, b_added),
+            );
+    }
     
     /// Caculate K = X * Y
     pub fn calc_k(&mut self) {
-        let a_id = self.token_a.account_id.clone();
-        let b_id = self.token_b.account_id.clone();
-
-        let x = self.token_a.ft.internal_unwrap_balance_of(&a_id) / 10_u128.pow(self.token_a.meta.decimals as u32);
-        let y = self.token_b.ft.internal_unwrap_balance_of(&b_id) / 10_u128.pow(self.token_b.meta.decimals as u32);
+        let x = self.token_a.reserve / 10_u128.pow(self.token_a.decimal as u32);
+        let y = self.token_b.reserve / 10_u128.pow(self.token_b.decimal as u32);
         
         self.k = x * y;
     }
@@ -279,7 +312,7 @@ mod tests {
         let (a_id, b_id) = (a_acount.id().clone(), b_acount.id().clone());
 
         let contract = worker.dev_deploy(&wasm).await?;
-        let contract_id = contract.as_account().id().clone();
+        // let contract_id = contract.as_account().id().clone();
 
         // Call function a only to ensure it has correct behaviour
         let _ = 
@@ -299,9 +332,9 @@ mod tests {
         println!("[+] info: {:?}", info0.json::<((AccountId, String, Balance, u8), (AccountId, String, Balance, u8))>()?);
  
         // test add_liquidity
-        let res0 = 
+        let _res0 = 
             contract.call("add_liquidity")
-            // owner_account.call(&contract_id, "add_liquidity")
+            // a_acount.call(&contract_id, "add_liquidity")
             .args_json(
                 serde_json::json!({
                     "amount_a": 10,
@@ -311,7 +344,6 @@ mod tests {
             .max_gas()
             .transact()
             .await?;
-        println!("{:?}", res0);
 
         let info0 = contract.
             call("get_info")
