@@ -1,15 +1,14 @@
 use near_sdk::{
     ext_contract, 
     AccountId, Balance,
-    json_types::U128,
 };
 
 #[ext_contract(ext_token)]
 trait ExtToken {
     fn get_info(&self) -> (String, u8);
     fn register_amm(&mut self, sender_id: AccountId, amount: Balance);
-    /// Transfers positive amount of tokens from the env::predecessor_account_id to receiver_id. 
-    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128);
+    /// Transfers positive amount of tokens from the sender_id to receiver_id. 
+    fn transfer_from(&mut self, sender_id: AccountId, receiver_id: AccountId, amount: Balance);
 }
 
 #[ext_contract(ext_c)]

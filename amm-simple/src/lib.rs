@@ -123,6 +123,7 @@ impl Contract {
     pub fn swap(&mut self, token_in: AccountId, amount_in: Balance) {
         require!(token_in == self.token_a.account_id || token_in == self.token_b.account_id, "invalid token");
         require!(amount_in > 0, "amount in = 0");
+        let sender_id = env::predecessor_account_id();
 
         // Pull in token in;
         if token_in == self.token_a.account_id {
@@ -139,11 +140,11 @@ impl Contract {
             let amount_out = calc_dy(x, y, amount_in);
             
             let a_added = self.token_a.reserve + amount_in;
-            let b_added = self.token_b.reserve - amount_out;
+            let b_added = self.token_b.reserve.checked_sub(amount_out).expect("Not overflow");
 
             // Transfer token out to sender
-            ext_token::ext(env::predecessor_account_id())
-            .ft_transfer(self.token_a.account_id.clone(), amount_in.into())
+            ext_token::ext(self.token_a.account_id.clone())
+            .transfer_from(sender_id.clone(), env::current_account_id(), amount_in.into())
             .then(
                 ext_c::ext(env::current_account_id())
                 .callback_ft_deposit(
@@ -165,11 +166,11 @@ impl Contract {
             let amount_out = calc_dy(x, y, amount_in);
             
             let b_added = self.token_b.reserve + amount_in;
-            let a_added = self.token_a.reserve - amount_out;
+            let a_added = self.token_a.reserve.checked_sub(amount_out).expect("Not overflow");
 
             // Transfer token out to sender
-            ext_token::ext(env::predecessor_account_id())
-            .ft_transfer(self.token_b.account_id.clone(), amount_in.into())
+            ext_token::ext(self.token_b.account_id.clone())
+            .transfer_from(sender_id.clone(), env::current_account_id(), amount_in.into())
             .then(
                 ext_c::ext(env::current_account_id())
                 .callback_ft_deposit(
@@ -184,6 +185,10 @@ impl Contract {
     }
 
     /// Add tokens to the liquidity pool.
+    /// 
+    /// The owner of the contract can transfer a certain amount of tokens A or B to the contract account,
+    /// thereby changing the ratio K.
+    #[payable]
     pub fn add_liquidity(&mut self, amount_a: Balance, amount_b: Balance) {
         require!(env::predecessor_account_id() == self.admin, "Must be owner");
 
@@ -193,15 +198,15 @@ impl Contract {
         // TODO: Mint shares
         // Update reserves
 
-        ext_token::ext(self.admin.clone())
-            .ft_transfer(self.token_a.account_id.clone(), amount_a.into())
+        ext_token::ext(self.token_a.account_id.clone())
+            .transfer_from(self.admin.clone(), self.token_a.account_id.clone(), amount_a.into())
             .then(
                 ext_c::ext(env::current_account_id())
                     .callback_update(a_added, b_added),
             );
         
-        ext_token::ext(self.admin.clone())
-            .ft_transfer(self.token_b.account_id.clone(), amount_b.into())
+        ext_token::ext(self.token_b.account_id.clone())
+            .transfer_from(self.admin.clone(), self.token_b.account_id.clone(), amount_b.into())
             .then(
                 ext_c::ext(env::current_account_id())
                     .callback_update(a_added, b_added),
@@ -230,7 +235,7 @@ impl Contract {
         );
 
         ext_token::ext(contract_id)
-            .ft_transfer(receiver_id, amount.into())
+            .transfer_from(env::current_account_id(), receiver_id, amount.into())
             .then(
                 ext_c::ext(env::current_account_id())
                     .callback_update(a_added, b_added),
@@ -301,30 +306,41 @@ mod tests {
 
     #[tokio::test]
     async fn workspaces_test() -> anyhow::Result<()> {
-        let wasm = fs::read("res/amm_simple.wasm").await?;
+        let amm_wasm = fs::read("../res/amm_simple.wasm").await?;
+        let token_wasm = fs::read("../res/token_contract.wasm").await?;
         let worker = workspaces::sandbox().await?;
 
-        let owner_account = worker.dev_create_account().await?;
-        let owner_id = owner_account.id().clone();
+        let (amm_owner_account, token_owner_account) = (worker.dev_create_account().await?, worker.dev_create_account().await?);
+        let (amm_owner_id, token_owner_id) = (amm_owner_account.id().clone(), token_owner_account.id().clone());
 
 
         let (a_acount, b_acount) = (worker.dev_create_account().await?, worker.dev_create_account().await?);
         let (a_id, b_id) = (a_acount.id().clone(), b_acount.id().clone());
 
-        let contract = worker.dev_deploy(&wasm).await?;
-        // let contract_id = contract.as_account().id().clone();
+        let amm_contract = worker.dev_deploy(&amm_wasm).await?;
 
-        // Call function a only to ensure it has correct behaviour
+        let token_contract = worker.dev_deploy(&token_wasm).await?;
+
         let _ = 
-            contract.call("init")
+            amm_contract.call("init")
             // owner_account.call(&contract_id, "init")
-            .args_json((owner_id,  a_id, b_id))
+            .args_json((amm_owner_id.clone(),  a_id.clone(), b_id.clone()))
             // .args_json((contract_id, a_id, b_id))
             .max_gas()
             .transact()
             .await?;
+
+        let _ = 
+            token_contract.call("init")
+            // owner_account.call(&contract_id, "init")
+            .args_json((amm_owner_id.clone(),  a_id.clone(), b_id.clone()))
+            // .args_json((contract_id, a_id, b_id))
+            .max_gas()
+            .transact()
+            .await?;
+
         // test get_info
-        let info0 = contract.
+        let info0 = amm_contract.
             call("get_info")
             .max_gas()
             .transact()
@@ -332,9 +348,8 @@ mod tests {
         println!("[+] info: {:?}", info0.json::<((AccountId, String, Balance, u8), (AccountId, String, Balance, u8))>()?);
  
         // test add_liquidity
-        let _res0 = 
-            contract.call("add_liquidity")
-            // a_acount.call(&contract_id, "add_liquidity")
+        let _ = 
+            amm_owner_account.call(&amm_contract.id(), "add_liquidity")
             .args_json(
                 serde_json::json!({
                     "amount_a": 10,
@@ -345,12 +360,33 @@ mod tests {
             .transact()
             .await?;
 
-        let info0 = contract.
+        let info1 = amm_contract.
             call("get_info")
             .max_gas()
             .transact()
             .await?;
-        println!("[+] info: {:?}", info0.json::<((AccountId, String, Balance, u8), (AccountId, String, Balance, u8))>()?);
+        println!("[+] info: {:?}", info1.json::<((AccountId, String, Balance, u8), (AccountId, String, Balance, u8))>()?);
+        
+        // test swap
+        let res0 = 
+        a_acount.call(&amm_contract.id(), "swap")
+        .args_json(
+            serde_json::json!({
+                "token_in": a_id.clone(),
+                "amount_in": 1
+            })
+        )
+        .max_gas()
+        .transact()
+        .await?;
+        println!("{:?}", res0);
+        let info2 = amm_contract.
+            call("get_info")
+            .max_gas()
+            .transact()
+            .await?;
+        println!("[+] info: {:?}", info2.json::<((AccountId, String, Balance, u8), (AccountId, String, Balance, u8))>()?);
+        
 
         Ok(())
     }

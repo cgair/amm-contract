@@ -40,8 +40,8 @@ near create-account $AMM_ID --masterAccount $OWNER_ID
 
 ### Deploy Smart Contract
 ```bash
-# near deploy $a_id --wasmFile="<path-to-contract>/token_contract.wasm"
-# near deploy $b_id --wasmFile="<path-to-contract>/token_contract.wasm"
+near deploy $a_id --wasmFile="<path-to-contract>/token_contract.wasm"
+near deploy $b_id --wasmFile="<path-to-contract>/token_contract.wasm"
 near deploy $amm_id --wasmFile="<path-to-contract>/amm_simple.wasm"
 ```
 
